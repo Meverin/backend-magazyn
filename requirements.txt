@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2
+passlib[argon2]
+python-jose
+python-multipart
+pydantic
+openpyxl
+reportlab
