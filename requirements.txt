@@ -1,10 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
+psycopg2-binary
 sqlalchemy
-psycopg2
-passlib[argon2]
-python-jose
-python-multipart
-pydantic
-openpyxl
-reportlab
+alembic
+python-dotenv
