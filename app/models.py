@@ -28,6 +28,7 @@ class Product(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)            # nazwa
+    category = Column(String, nullable=False) 
     index = Column(String, unique=True, index=True, nullable=False)  # indeks
     unit = Column(String, nullable=False)            # jednostka (szt, m, kg...)
     description = Column(Text, nullable=True)        # opcjonalny opis
@@ -59,3 +60,4 @@ class StockMovement(Base):
     quantity = Column(Float, nullable=False)  # dodatnie = IN, ujemne = OUT
     type = Column(String, nullable=False)     # 'IN' lub 'OUT'
     place = Column(String, nullable=True)     # tylko OUT
+
