@@ -10,3 +10,4 @@ email-validator
 psycopg2-binary
 reportlab
 openpyxl
+argon2-cffi
