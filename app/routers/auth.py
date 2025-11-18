@@ -113,7 +113,7 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     access_token = create_access_token({"sub": str(user.id)})
 
     return TokenResponse(access_token=access_token)
-    return {"token": token, "role": user.role}
+    return {"token": token, "role": user.role, "name": user.name}
 
 
 
@@ -131,4 +131,5 @@ def activate_user(user_id: int, db: Session = Depends(get_db)):
     user.is_active = True
     db.commit()
     return {"message": f"Konto użytkownika {user.email} zostało aktywowane"}
+
 
