@@ -117,3 +117,4 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
         role=user.role,
         name=user.name
     )
+
