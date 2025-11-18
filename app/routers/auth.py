@@ -1,6 +1,6 @@
 # app/routers/auth.py
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from jose import jwt
@@ -8,12 +8,13 @@ from datetime import datetime, timedelta
 
 from ..database import get_db
 from .. import models
+from pydantic import BaseModel, EmailStr
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
-SECRET_KEY = "supersekretnyklucz"  # potem przeniesiemy do .env
+SECRET_KEY = "supersekretnyklucz"      # przeniesiemy do .env później
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -45,8 +46,6 @@ def create_access_token(data: dict):
 # Schemas
 # -----------------------------
 
-from pydantic import BaseModel, EmailStr
-
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
@@ -59,13 +58,14 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+class LoginResponse(BaseModel):
+    token: str
+    role: str
+    name: str
 
 
 # -----------------------------
-# ROUTES
+# REGISTER
 # -----------------------------
 
 @router.post("/register")
@@ -86,17 +86,21 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
         password_hash=hash_password(req.password),
         name=req.name,
         car_plate=req.car_plate,
-        is_active=False  # admin musi aktywować
+        is_active=False,        # admin musi aktywować
+        role="user"             # domyślna rola
     )
 
     db.add(user)
     db.commit()
-    db.refresh(user)
 
     return {"message": "Rejestracja przebiegła pomyślnie. Konto oczekuje na aktywację przez administratora."}
 
 
-@router.post("/login", response_model=TokenResponse)
+# -----------------------------
+# LOGIN
+# -----------------------------
+
+@router.post("/login", response_model=LoginResponse)
 def login(req: LoginRequest, db: Session = Depends(get_db)):
 
     user = db.query(models.User).filter(models.User.email == req.email).first()
@@ -110,18 +114,21 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Konto nieaktywne. Skontaktuj się z administratorem.")
 
-    access_token = create_access_token({"sub": str(user.id)})
+    token = create_access_token({"sub": str(user.id)})
 
-    return TokenResponse(access_token=access_token)
-    return {"token": token, "role": user.role, "name": user.name}
+    return LoginResponse(
+        token=token,
+        role=user.role,
+        name=user.name
+    )
 
 
+# -----------------------------
+# ACTIVATE USER
+# -----------------------------
 
 @router.post("/activate/{user_id}")
 def activate_user(user_id: int, db: Session = Depends(get_db)):
-    """
-    Tymczasowy endpoint admina. Później dorobimy prawdziwy panel admina + role.
-    """
 
     user = db.query(models.User).filter(models.User.id == user_id).first()
 
@@ -130,6 +137,5 @@ def activate_user(user_id: int, db: Session = Depends(get_db)):
 
     user.is_active = True
     db.commit()
+
     return {"message": f"Konto użytkownika {user.email} zostało aktywowane"}
-
-
