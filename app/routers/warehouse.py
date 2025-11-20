@@ -267,3 +267,56 @@ def history(
         ))
 
     return result
+# -----------------------------
+# UPDATE CAR STATE (FULL RESET)
+# -----------------------------
+class UpdateCarStateItemDto(BaseModel):
+    product_id: int
+    quantity: float = Field(ge=0)
+
+class UpdateCarStateRequestDto(BaseModel):
+    items: list[UpdateCarStateItemDto]
+
+
+@router.post("/update-car-state")
+def update_car_state(
+    req: UpdateCarStateRequestDto,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    """
+    Nadpisuje cały stan magazynowy samochodu:
+    1) czyści car_stock dla danego auta
+    2) wpisuje nowe rekordy
+    3) tworzy logi w stock_movements
+    """
+
+    # 1. Usuń aktualny stan
+    db.query(models.CarStock).filter(
+        models.CarStock.car_plate == user.car_plate
+    ).delete()
+
+    # 2. Dodaj nowe pozycje
+    for item in req.items:
+        stock = models.CarStock(
+            car_plate=user.car_plate,
+            product_id=item.product_id,
+            quantity=item.quantity
+        )
+        db.add(stock)
+
+        # zapis do logów (IN)
+        movement = models.StockMovement(
+            user_id=user.id,
+            car_plate=user.car_plate,
+            product_id=item.product_id,
+            quantity=item.quantity,
+            type="IN",
+            place=None
+        )
+        db.add(movement)
+
+    db.commit()
+
+    return {"status": "OK", "message": "Stan samochodu został zaktualizowany"}
+
