@@ -360,3 +360,57 @@ def get_car_state(
         )
         for r in rows
     ]
+@router.get("/car/state/export")
+def export_car_state(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """
+    Eksport aktualnego stanu magazynu auta do Excela.
+    """
+    # pobranie całego stanu auta
+    rows = (
+        db.query(
+            models.Product.name,
+            models.Product.category,
+            models.Product.unit,
+            models.CarStock.quantity
+        )
+        .join(models.Product, models.Product.id == models.CarStock.product_id)
+        .filter(models.CarStock.car_plate == user.car_plate)
+        .order_by(models.Product.id)
+        .all()
+    )
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="Brak towaru w samochodzie")
+
+    # generowanie XLSX
+    from openpyxl import Workbook
+    import io
+    from fastapi.responses import StreamingResponse
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Stan magazynu"
+
+    ws.append(["Nazwa", "Kategoria", "Jednostka", "Ilość"])
+
+    for name, category, unit, qty in rows:
+        ws.append([name, category, unit, qty])
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    filename = f"stan_{user.car_plate}.xlsx"
+
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+    )
+
+
