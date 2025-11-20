@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, Float, DateTime, func
+from sqlalchemy import Column, Integer, String, Boolean, Text, Float, DateTime, func, ForeignKey
+from sqlalchemy.orm import relationship
 from .database import Base
 
 
@@ -14,10 +15,13 @@ class User(Base):
     name = Column(String, nullable=False)
     car_plate = Column(String, nullable=False)
 
-    # NOWE POLE – role
-    role = Column(String, nullable=False, default="user")   # user / admin
+    # rola: user / admin
+    role = Column(String, nullable=False, default="user")
 
     is_active = Column(Boolean, default=False)
+
+    # relacja do historii ruchów
+    movements = relationship("StockMovement", back_populates="user")
 
 
 # -----------------------------
@@ -27,11 +31,14 @@ class Product(Base):
     __tablename__ = "products"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)            # nazwa
-    category = Column(String, nullable=False) 
-    index = Column(String, unique=True, index=True, nullable=False)  # indeks
-    unit = Column(String, nullable=False)            # jednostka (szt, m, kg...)
-    description = Column(Text, nullable=True)        # opcjonalny opis
+    name = Column(String, nullable=False)            
+    category = Column(String, nullable=False)
+    index = Column(String, unique=True, index=True, nullable=False)  
+    unit = Column(String, nullable=False)            
+    description = Column(Text, nullable=True)
+
+    # relacja do ruchów
+    movements = relationship("StockMovement", back_populates="product")
 
 
 # -----------------------------
@@ -41,9 +48,11 @@ class CarStock(Base):
     __tablename__ = "car_stock"
 
     id = Column(Integer, primary_key=True, index=True)
-    car_plate = Column(String, nullable=False)       # numer auta
-    product_id = Column(Integer, nullable=False)     # ID produktu
-    quantity = Column(Integer, nullable=False, default=0)
+    car_plate = Column(String, nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    quantity = Column(Float, nullable=False, default=0)
+
+    product = relationship("Product")
 
 
 # -----------------------------
@@ -53,11 +62,16 @@ class StockMovement(Base):
     __tablename__ = "stock_movements"
 
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, server_default=func.now())
-    user_id = Column(Integer, nullable=False)
-    car_plate = Column(String, nullable=False)
-    product_id = Column(Integer, nullable=False)
-    quantity = Column(Float, nullable=False)  # dodatnie = IN, ujemne = OUT
-    type = Column(String, nullable=False)     # 'IN' lub 'OUT'
-    place = Column(String, nullable=True)     # tylko OUT
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)  
+    car_plate = Column(String, nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+
+    quantity = Column(Float, nullable=False)  
+    type = Column(String, nullable=False)    # IN / OUT / RESET
+    place = Column(String, nullable=True)    
+
+    # relacje
+    user = relationship("User", back_populates="movements")
+    product = relationship("Product", back_populates="movements")
