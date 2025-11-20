@@ -14,13 +14,13 @@ router = APIRouter(
     tags=["products"]
 )
 
-
 # ---------- Schemy (Pydantic) ----------
 
 class ProductCreate(BaseModel):
     name: str
     index: str
     unit: str
+    category: Optional[str] = None
     description: Optional[str] = None
 
 
@@ -29,6 +29,7 @@ class ProductResponse(BaseModel):
     name: str
     index: str
     unit: str
+    category: Optional[str] = None
     description: Optional[str] = None
 
     class Config:
@@ -58,6 +59,7 @@ def create_product(
         name=product.name,
         index=product.index,
         unit=product.unit,
+        category=product.category,
         description=product.description,
     )
 
@@ -72,5 +74,5 @@ def create_product(
 def list_products(
     db: Session = Depends(get_db),
 ):
-    products = db.query(models.Product).order_by(models.Product.name).all()
+    products = db.query(models.Product).order_by(models.Product.id).all()
     return products
