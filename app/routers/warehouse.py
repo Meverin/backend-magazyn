@@ -320,3 +320,43 @@ def update_car_state(
 
     return {"status": "OK", "message": "Stan samochodu został zaktualizowany"}
 
+class CarStockItem(BaseModel):
+    product_id: int
+    name: str
+    category: str | None
+    unit: str
+    quantity: float
+
+    class Config:
+        orm_mode = True
+
+
+@router.get("/car/state", response_model=list[CarStockItem])
+def get_car_state(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    rows = (
+        db.query(
+            models.CarStock.product_id,
+            models.Product.name,
+            models.Product.category,
+            models.Product.unit,
+            models.CarStock.quantity
+        )
+        .join(models.Product, models.Product.id == models.CarStock.product_id)
+        .filter(models.CarStock.car_plate == user.car_plate)
+        .order_by(models.Product.id)
+        .all()
+    )
+
+    return [
+        CarStockItem(
+            product_id=r.product_id,
+            name=r.name,
+            category=r.category,
+            unit=r.unit,
+            quantity=r.quantity
+        )
+        for r in rows
+    ]
