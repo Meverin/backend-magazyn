@@ -11,21 +11,29 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# DODANE: inne parametry dla SQLite
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args={"check_same_thread": False},  # wymagane dla SQLite w trybie wielowątkowym
-        echo=False
-    )
-else:
-    engine = create_engine(DATABASE_URL, echo=False)
+# Railway zwraca URL zaczynający się od "postgres://"
+# SQLAlchemy wymaga "postgresql://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Silnik bazy
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,     # automatycznie odświeża zerwane połączenia
+    echo=False
+)
 
+# sesja DB
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
+# baza modeli
 Base = declarative_base()
 
-
+# dependency injection dla FastAPI
 def get_db():
     db = SessionLocal()
     try:
