@@ -3,25 +3,25 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
-from jose import jwt
+from jose import jwt, JWTError
 from datetime import datetime, timedelta
+from pydantic import BaseModel, EmailStr
 
 from ..database import get_db
 from .. import models
-from pydantic import BaseModel, EmailStr
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
-SECRET_KEY = "supersekretnyklucz"      # przeniesiemy do .env później
+SECRET_KEY = "supersekretnyklucz"        # później przeniesiemy do .env
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 
-# -----------------------------
+# ======================================================
 # Helpers
-# -----------------------------
+# ======================================================
 
 def verify_domain(email: str) -> bool:
     return email.endswith("@promax.media.pl") or email.endswith("@promaxnet.pl")
@@ -36,15 +36,25 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def create_access_token(data: dict):
+    """Tworzy token JWT"""
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
+
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-# -----------------------------
+def decode_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+# ======================================================
 # Schemas
-# -----------------------------
+# ======================================================
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -62,11 +72,30 @@ class LoginResponse(BaseModel):
     token: str
     role: str
     name: str
+    user_id: int
 
 
-# -----------------------------
+# ======================================================
+# Dependency – pobranie aktualnego usera
+# ======================================================
+
+def get_current_user(token: str, db: Session):
+    user_id = decode_token(token)
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Niepoprawny token")
+
+    user = db.query(models.User).filter(models.User.id == int(user_id)).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="Użytkownik nie istnieje")
+
+    return user
+
+
+# ======================================================
 # REGISTER
-# -----------------------------
+# ======================================================
 
 @router.post("/register")
 def register(req: RegisterRequest, db: Session = Depends(get_db)):
@@ -86,8 +115,8 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
         password_hash=hash_password(req.password),
         name=req.name,
         car_plate=req.car_plate,
-        is_active=False,        # admin musi aktywować
-        role="user"             # domyślna rola
+        role="user",
+        is_active=False   # admin musi aktywować
     )
 
     db.add(user)
@@ -96,9 +125,9 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     return {"message": "Rejestracja przebiegła pomyślnie. Konto oczekuje na aktywację przez administratora."}
 
 
-# -----------------------------
+# ======================================================
 # LOGIN
-# -----------------------------
+# ======================================================
 
 @router.post("/login", response_model=LoginResponse)
 def login(req: LoginRequest, db: Session = Depends(get_db)):
@@ -119,13 +148,14 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     return LoginResponse(
         token=token,
         role=user.role,
-        name=user.name
+        name=user.name,
+        user_id=user.id
     )
 
 
-# -----------------------------
+# ======================================================
 # ACTIVATE USER
-# -----------------------------
+# ======================================================
 
 @router.post("/activate/{user_id}")
 def activate_user(user_id: int, db: Session = Depends(get_db)):
