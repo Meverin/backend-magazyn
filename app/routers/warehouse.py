@@ -3,16 +3,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
-from datetime import date, datetime, time, timedelta
-from typing import Literal
+from typing import List, Optional
 import io
 
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func
-
 from openpyxl import Workbook
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
 
 from ..database import get_db
 from ..auth_utils import get_current_user
@@ -21,13 +16,13 @@ from .. import models
 router = APIRouter(prefix="/warehouse", tags=["warehouse"])
 
 # =====================================================
-# Schemy
+# SCHEMY DTO
 # =====================================================
 
 class ProductDto(BaseModel):
     id: int
     name: str
-    category: str
+    category: Optional[str] = None
     index: str
     unit: str
 
@@ -35,99 +30,18 @@ class ProductDto(BaseModel):
         orm_mode = True
 
 
-class UpdateCarStateItemDto(BaseModel):
-    product_id: int
-    quantity: float
-
-
-class UpdateCarStateRequestDto(BaseModel):
-    items: list[UpdateCarStateItemDto]
-
-
-# =====================================================
-# Dane produktów (dla listy we wprowadzaniu stanu)
-# =====================================================
-
-@router.get("/products", response_model=list[ProductDto])
-def get_products(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    products = db.query(models.Product).order_by(models.Product.name).all()
-    return products
-
-
-# =====================================================
-# WPROWADZENIE STANU — GŁÓWNY ENDPOINT
-# =====================================================
-
-@router.post("/update-car-state")
-def update_car_state(
-    req: UpdateCarStateRequestDto,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user)
-):
-    """
-    1. Czyści cały stan samochodu
-    2. Wpisuje nowe ilości
-    3. Zapisuje historię zmian
-    """
-
-    car_plate = user.car_plate
-
-    # ---------------------------
-    # 1. USUNIĘCIE obecnego stanu
-    # ---------------------------
-    db.query(models.CarStock).filter(
-        models.CarStock.car_plate == car_plate
-    ).delete()
-
-    db.commit()
-
-    # ---------------------------
-    # 2. WPROWADZENIE NOWEGO STANU
-    # ---------------------------
-    for item in req.items:
-        if item.quantity <= 0:
-            continue
-
-        # Sprawdzenie czy produkt istnieje
-        product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
-        if not product:
-            raise HTTPException(status_code=404, detail=f"Produkt ID={item.product_id} nie istnieje")
-
-        new_row = models.CarStock(
-            car_plate=car_plate,
-            product_id=item.product_id,
-            quantity=item.quantity
-        )
-        db.add(new_row)
-
-        # Historia
-        log = models.StockMovement(
-            user_id=user.id,
-            car_plate=car_plate,
-            product_id=item.product_id,
-            quantity=item.quantity,     # traktujemy wprowadzony stan jako IN
-            type="IN",
-            place=None
-        )
-        db.add(log)
-
-    db.commit()
-
-    return {"status": "OK", "message": "Stan samochodu zaktualizowany"}
-
-
-# =====================================================
-# Pozostałe endpointy (PRZYJĘCIE / ROZCHÓD / HISTORIA)
-# =====================================================
-
 class ReceiveRequest(BaseModel):
+    """Pobranie towaru z magazynu zewnętrznego na samochód."""
     product_id: int
     quantity: float = Field(gt=0)
 
+
 class IssueRequest(BaseModel):
+    """Rozchód towaru z samochodu (zużycie w terenie)."""
     product_id: int
     quantity: float = Field(gt=0)
     place: str
+
 
 class MovementItem(BaseModel):
     id: int
@@ -137,27 +51,86 @@ class MovementItem(BaseModel):
     index: str
     quantity: float
     type: str
-    place: str | None
+    place: Optional[str]
 
     class Config:
         orm_mode = True
 
 
-# ==== receive_goods =============
+class UpdateCarStateItemDto(BaseModel):
+    """Pojedyncza pozycja przy pełnym wprowadzeniu stanu auta."""
+    product_id: int
+    quantity: float = Field(ge=0)
+
+
+class UpdateCarStateRequestDto(BaseModel):
+    items: List[UpdateCarStateItemDto]
+
+
+class CarStockItem(BaseModel):
+    product_id: int
+    name: str
+    category: Optional[str]
+    unit: str
+    quantity: float
+
+    class Config:
+        orm_mode = True
+
+
+# =====================================================
+# LISTA PRODUKTÓW
+# =====================================================
+
+@router.get("/products", response_model=List[ProductDto])
+def get_products(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    """
+    Zwraca listę wszystkich produktów – używane w wyszukiwaniu
+    / podpowiedziach po stronie aplikacji.
+    """
+    products = (
+        db.query(models.Product)
+        .order_by(models.Product.name)
+        .all()
+    )
+    return products
+
+
+# =====================================================
+# POBRANIE TOWARU NA SAMOCHÓD (PRZYJĘCIE)
+# =====================================================
+
 @router.post("/receive")
 def receive_goods(
     req: ReceiveRequest,
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-    product = db.query(models.Product).filter(models.Product.id == req.product_id).first()
+    """
+    Pobranie towaru z magazynu zewnętrznego na samochód:
+    - jeżeli pozycja już istnieje w car_stock → zwiększamy ilość,
+    - jeżeli nie ma → tworzymy nowy rekord.
+    - zapisujemy ruch w stock_movements z type="IN".
+    """
+    product = (
+        db.query(models.Product)
+        .filter(models.Product.id == req.product_id)
+        .first()
+    )
     if not product:
         raise HTTPException(status_code=404, detail="Produkt nie istnieje")
 
-    stock = db.query(models.CarStock).filter(
-        models.CarStock.car_plate == user.car_plate,
-        models.CarStock.product_id == req.product_id
-    ).first()
+    stock = (
+        db.query(models.CarStock)
+        .filter(
+            models.CarStock.car_plate == user.car_plate,
+            models.CarStock.product_id == req.product_id
+        )
+        .first()
+    )
 
     if not stock:
         stock = models.CarStock(
@@ -174,35 +147,61 @@ def receive_goods(
         car_plate=user.car_plate,
         product_id=req.product_id,
         quantity=req.quantity,
-        type="IN"
+        type="IN",
+        place=None
     )
     db.add(movement)
 
     db.commit()
-    return {"status": "OK", "message": "Przyjęto towar", "quantity": stock.quantity}
+
+    return {
+        "status": "OK",
+        "message": "Przyjęto towar na samochód",
+        "quantity": stock.quantity
+    }
 
 
-# ==== issue_goods =============
+# =====================================================
+# ROZCHÓD TOWARU Z SAMOCHODU
+# =====================================================
+
 @router.post("/issue")
 def issue_goods(
     req: IssueRequest,
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-    product = db.query(models.Product).filter(models.Product.id == req.product_id).first()
+    """
+    Rozchód towaru z samochodu:
+    - sprawdza czy produkt istnieje i jest na stanie,
+    - pilnuje, żeby nie zejść poniżej zera,
+    - zapisuje ruch w stock_movements z type="OUT".
+    """
+    product = (
+        db.query(models.Product)
+        .filter(models.Product.id == req.product_id)
+        .first()
+    )
     if not product:
         raise HTTPException(status_code=404, detail="Produkt nie istnieje")
 
-    stock = db.query(models.CarStock).filter(
-        models.CarStock.car_plate == user.car_plate,
-        models.CarStock.product_id == req.product_id
-    ).first()
+    stock = (
+        db.query(models.CarStock)
+        .filter(
+            models.CarStock.car_plate == user.car_plate,
+            models.CarStock.product_id == req.product_id
+        )
+        .first()
+    )
 
     if not stock:
         raise HTTPException(status_code=400, detail="Brak produktu w aucie")
 
     if stock.quantity < req.quantity:
-        raise HTTPException(status_code=400, detail=f"Dostępne tylko: {stock.quantity}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dostępne tylko: {stock.quantity}"
+        )
 
     stock.quantity -= req.quantity
 
@@ -217,66 +216,17 @@ def issue_goods(
     db.add(movement)
 
     db.commit()
-    return {"status": "OK", "message": "Rozchodowano towar", "quantity": stock.quantity}
+
+    return {
+        "status": "OK",
+        "message": "Rozchodowano towar",
+        "quantity": stock.quantity
+    }
 
 
-# ==== historia =================
-@router.get("/history", response_model=list[MovementItem])
-def history(
-    product_id: int | None = None,
-    type: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user)
-):
-
-    q = (
-        db.query(models.StockMovement, models.Product)
-        .join(models.Product, models.Product.id == models.StockMovement.product_id)
-        .filter(models.StockMovement.car_plate == user.car_plate)
-    )
-
-    if product_id:
-        q = q.filter(models.StockMovement.product_id == product_id)
-
-    if type:
-        q = q.filter(models.StockMovement.type == type)
-
-    if date_from:
-        q = q.filter(models.StockMovement.timestamp >= date_from)
-
-    if date_to:
-        q = q.filter(models.StockMovement.timestamp <= date_to)
-
-    q = q.order_by(models.StockMovement.timestamp.desc())
-
-    rows = q.all()
-    result = []
-
-    for movement, product in rows:
-        result.append(MovementItem(
-            id=movement.id,
-            timestamp=str(movement.timestamp),
-            product_id=product.id,
-            product_name=product.name,
-            index=product.index,
-            quantity=movement.quantity,
-            type=movement.type,
-            place=movement.place
-        ))
-
-    return result
-# -----------------------------
-# UPDATE CAR STATE (FULL RESET)
-# -----------------------------
-class UpdateCarStateItemDto(BaseModel):
-    product_id: int
-    quantity: float = Field(ge=0)
-
-class UpdateCarStateRequestDto(BaseModel):
-    items: list[UpdateCarStateItemDto]
-
+# =====================================================
+# PEŁNE WPROWADZENIE STANU SAMOCHODU (RESET)
+# =====================================================
 
 @router.post("/update-car-state")
 def update_car_state(
@@ -286,9 +236,9 @@ def update_car_state(
 ):
     """
     Nadpisuje cały stan magazynowy samochodu:
-    1) czyści car_stock dla danego auta
-    2) wpisuje nowe rekordy
-    3) tworzy logi w stock_movements
+    1) czyści car_stock dla danego auta,
+    2) wpisuje nowe rekordy z req.items,
+    3) tworzy logi w stock_movements (IN) dla każdej pozycji.
     """
 
     # 1. Usuń aktualny stan
@@ -298,6 +248,16 @@ def update_car_state(
 
     # 2. Dodaj nowe pozycje
     for item in req.items:
+        if item.quantity < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Ilość nie może być ujemna (product_id={item.product_id})"
+            )
+
+        if item.quantity == 0:
+            # zero pomijamy – nie ma sensu tworzyć rekordu
+            continue
+
         stock = models.CarStock(
             car_plate=user.car_plate,
             product_id=item.product_id,
@@ -305,7 +265,6 @@ def update_car_state(
         )
         db.add(stock)
 
-        # zapis do logów (IN)
         movement = models.StockMovement(
             user_id=user.id,
             car_plate=user.car_plate,
@@ -320,18 +279,12 @@ def update_car_state(
 
     return {"status": "OK", "message": "Stan samochodu został zaktualizowany"}
 
-class CarStockItem(BaseModel):
-    product_id: int
-    name: str
-    category: str | None
-    unit: str
-    quantity: float
 
-    class Config:
-        orm_mode = True
+# =====================================================
+# AKTUALNY STAN SAMOCHODU
+# =====================================================
 
-
-@router.get("/car/state", response_model=list[CarStockItem])
+@router.get("/car/state", response_model=List[CarStockItem])
 def get_car_state(
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
@@ -360,15 +313,73 @@ def get_car_state(
         )
         for r in rows
     ]
+
+
+# =====================================================
+# HISTORIA RUCHÓW
+# =====================================================
+
+@router.get("/history", response_model=List[MovementItem])
+def history(
+    product_id: Optional[int] = None,
+    type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    q = (
+        db.query(models.StockMovement, models.Product)
+        .join(models.Product, models.Product.id == models.StockMovement.product_id)
+        .filter(models.StockMovement.car_plate == user.car_plate)
+    )
+
+    if product_id is not None:
+        q = q.filter(models.StockMovement.product_id == product_id)
+
+    if type is not None:
+        q = q.filter(models.StockMovement.type == type)
+
+    if date_from is not None:
+        q = q.filter(models.StockMovement.timestamp >= date_from)
+
+    if date_to is not None:
+        q = q.filter(models.StockMovement.timestamp <= date_to)
+
+    q = q.order_by(models.StockMovement.timestamp.desc())
+
+    rows = q.all()
+    result: List[MovementItem] = []
+
+    for movement, product in rows:
+        result.append(
+            MovementItem(
+                id=movement.id,
+                timestamp=str(movement.timestamp),
+                product_id=product.id,
+                product_name=product.name,
+                index=product.index,
+                quantity=movement.quantity,
+                type=movement.type,
+                place=movement.place,
+            )
+        )
+
+    return result
+
+
+# =====================================================
+# EKSPORT STANU SAMOCHODU DO EXCELA
+# =====================================================
+
 @router.get("/car/state/export")
 def export_car_state(
     db: Session = Depends(get_db),
-    user = Depends(get_current_user)
+    user=Depends(get_current_user)
 ):
     """
-    Eksport aktualnego stanu magazynu auta do Excela.
+    Eksport aktualnego stanu magazynu auta do pliku XLSX.
     """
-    # pobranie całego stanu auta
     rows = (
         db.query(
             models.Product.name,
@@ -384,11 +395,6 @@ def export_car_state(
 
     if not rows:
         raise HTTPException(status_code=400, detail="Brak towaru w samochodzie")
-
-    # generowanie XLSX
-    from openpyxl import Workbook
-    import io
-    from fastapi.responses import StreamingResponse
 
     wb = Workbook()
     ws = wb.active
@@ -407,10 +413,11 @@ def export_car_state(
 
     return StreamingResponse(
         stream,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"'
         }
     )
-
-
