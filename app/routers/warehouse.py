@@ -5,9 +5,12 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import io
+from datetime import datetime
 
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
 
 from ..database import get_db
 from ..auth_utils import get_current_user
@@ -16,7 +19,7 @@ from .. import models
 router = APIRouter(prefix="/warehouse", tags=["warehouse"])
 
 # =====================================================
-# SCHEMY DTO
+# DTO – PRODUKTY
 # =====================================================
 
 class ProductDto(BaseModel):
@@ -30,18 +33,40 @@ class ProductDto(BaseModel):
         orm_mode = True
 
 
+# =====================================================
+# DTO – PROSTE POBRANIE (legacy /receive)
+# =====================================================
+
 class ReceiveRequest(BaseModel):
-    """Pobranie towaru z magazynu zewnętrznego na samochód."""
     product_id: int
     quantity: float = Field(gt=0)
 
 
 class IssueRequest(BaseModel):
-    """Rozchód towaru z samochodu (zużycie w terenie)."""
     product_id: int
     quantity: float = Field(gt=0)
     place: str
 
+
+# =====================================================
+# DTO – NOWY DOKUMENT POBRANIA
+# =====================================================
+
+class GoodsReceiptItemDto(BaseModel):
+    product_id: int
+    quantity: float = Field(gt=0)
+
+
+class GoodsReceiptRequestDto(BaseModel):
+    date: str                     # ISO string YYYY-MM-DD lub pełna data
+    received_by: str              # osoba pobierająca
+    issued_by: str                # osoba wydająca
+    items: List[GoodsReceiptItemDto]
+
+
+# =====================================================
+# DTO – HISTORIA RUCHÓW
+# =====================================================
 
 class MovementItem(BaseModel):
     id: int
@@ -57,8 +82,11 @@ class MovementItem(BaseModel):
         orm_mode = True
 
 
+# =====================================================
+# DTO – WPROWADZENIE STANU (RESET)
+# =====================================================
+
 class UpdateCarStateItemDto(BaseModel):
-    """Pojedyncza pozycja przy pełnym wprowadzeniu stanu auta."""
     product_id: int
     quantity: float = Field(ge=0)
 
@@ -83,341 +111,284 @@ class CarStockItem(BaseModel):
 # =====================================================
 
 @router.get("/products", response_model=List[ProductDto])
-def get_products(
+def get_products(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    return db.query(models.Product).order_by(models.Product.name).all()
+
+
+# =====================================================
+# NOWE POBRANIE TOWARU (DOKUMENT)
+# =====================================================
+
+@router.post("/receive-document")
+def create_goods_receipt(
+    req: GoodsReceiptRequestDto,
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
     """
-    Zwraca listę wszystkich produktów – używane w wyszukiwaniu
-    / podpowiedziach po stronie aplikacji.
+    Nowe, pełne pobranie:
+    - nagłówek dokumentu (date, received_by, issued_by),
+    - wiele pozycji,
+    - ruchy w stock_movements (IN),
+    - aktualizacja car_stock.
     """
-    products = (
-        db.query(models.Product)
-        .order_by(models.Product.name)
-        .all()
-    )
-    return products
 
+    # 1) utworzenie nagłówka
+    try:
+        parsed_date = datetime.fromisoformat(req.date)
+    except:
+        raise HTTPException(400, "Nieprawidłowy format daty (wymagane ISO 8601)")
 
-# =====================================================
-# POBRANIE TOWARU NA SAMOCHÓD (PRZYJĘCIE)
-# =====================================================
-
-@router.post("/receive")
-def receive_goods(
-    req: ReceiveRequest,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user)
-):
-    """
-    Pobranie towaru z magazynu zewnętrznego na samochód:
-    - jeżeli pozycja już istnieje w car_stock → zwiększamy ilość,
-    - jeżeli nie ma → tworzymy nowy rekord.
-    - zapisujemy ruch w stock_movements z type="IN".
-    """
-    product = (
-        db.query(models.Product)
-        .filter(models.Product.id == req.product_id)
-        .first()
-    )
-    if not product:
-        raise HTTPException(status_code=404, detail="Produkt nie istnieje")
-
-    stock = (
-        db.query(models.CarStock)
-        .filter(
-            models.CarStock.car_plate == user.car_plate,
-            models.CarStock.product_id == req.product_id
-        )
-        .first()
-    )
-
-    if not stock:
-        stock = models.CarStock(
-            car_plate=user.car_plate,
-            product_id=req.product_id,
-            quantity=req.quantity
-        )
-        db.add(stock)
-    else:
-        stock.quantity += req.quantity
-
-    movement = models.StockMovement(
-        user_id=user.id,
+    receipt = models.GoodsReceipt(
+        date=parsed_date,
         car_plate=user.car_plate,
-        product_id=req.product_id,
-        quantity=req.quantity,
-        type="IN",
-        place=None
+        received_by=req.received_by.strip().title(),
+        issued_by=req.issued_by.strip().title(),
     )
-    db.add(movement)
-
+    db.add(receipt)
     db.commit()
+    db.refresh(receipt)
 
-    return {
-        "status": "OK",
-        "message": "Przyjęto towar na samochód",
-        "quantity": stock.quantity
-    }
-
-
-# =====================================================
-# ROZCHÓD TOWARU Z SAMOCHODU
-# =====================================================
-
-@router.post("/issue")
-def issue_goods(
-    req: IssueRequest,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user)
-):
-    """
-    Rozchód towaru z samochodu:
-    - sprawdza czy produkt istnieje i jest na stanie,
-    - pilnuje, żeby nie zejść poniżej zera,
-    - zapisuje ruch w stock_movements z type="OUT".
-    """
-    product = (
-        db.query(models.Product)
-        .filter(models.Product.id == req.product_id)
-        .first()
-    )
-    if not product:
-        raise HTTPException(status_code=404, detail="Produkt nie istnieje")
-
-    stock = (
-        db.query(models.CarStock)
-        .filter(
-            models.CarStock.car_plate == user.car_plate,
-            models.CarStock.product_id == req.product_id
-        )
-        .first()
-    )
-
-    if not stock:
-        raise HTTPException(status_code=400, detail="Brak produktu w aucie")
-
-    if stock.quantity < req.quantity:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Dostępne tylko: {stock.quantity}"
-        )
-
-    stock.quantity -= req.quantity
-
-    movement = models.StockMovement(
-        user_id=user.id,
-        car_plate=user.car_plate,
-        product_id=req.product_id,
-        quantity=-req.quantity,
-        type="OUT",
-        place=req.place
-    )
-    db.add(movement)
-
-    db.commit()
-
-    return {
-        "status": "OK",
-        "message": "Rozchodowano towar",
-        "quantity": stock.quantity
-    }
-
-
-# =====================================================
-# PEŁNE WPROWADZENIE STANU SAMOCHODU (RESET)
-# =====================================================
-
-@router.post("/update-car-state")
-def update_car_state(
-    req: UpdateCarStateRequestDto,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user)
-):
-    """
-    Nadpisuje cały stan magazynowy samochodu:
-    1) czyści car_stock dla danego auta,
-    2) wpisuje nowe rekordy z req.items,
-    3) tworzy logi w stock_movements (IN) dla każdej pozycji.
-    """
-
-    # 1. Usuń aktualny stan
-    db.query(models.CarStock).filter(
-        models.CarStock.car_plate == user.car_plate
-    ).delete()
-
-    # 2. Dodaj nowe pozycje
+    # 2) zapis pozycji i aktualizacja stanów
     for item in req.items:
-        if item.quantity < 0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Ilość nie może być ujemna (product_id={item.product_id})"
-            )
+        product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+        if not product:
+            raise HTTPException(404, f"Produkt ID={item.product_id} nie istnieje")
 
-        if item.quantity == 0:
-            # zero pomijamy – nie ma sensu tworzyć rekordu
-            continue
-
-        stock = models.CarStock(
-            car_plate=user.car_plate,
+        row = models.GoodsReceiptItem(
+            receipt_id=receipt.id,
             product_id=item.product_id,
             quantity=item.quantity
         )
-        db.add(stock)
+        db.add(row)
 
-        movement = models.StockMovement(
+        # aktualizacja car_stock
+        stock = db.query(models.CarStock).filter(
+            models.CarStock.car_plate == user.car_plate,
+            models.CarStock.product_id == item.product_id
+        ).first()
+
+        if not stock:
+            stock = models.CarStock(
+                car_plate=user.car_plate,
+                product_id=item.product_id,
+                quantity=item.quantity
+            )
+            db.add(stock)
+        else:
+            stock.quantity += item.quantity
+
+        # zapis ruchu
+        move = models.StockMovement(
             user_id=user.id,
             car_plate=user.car_plate,
             product_id=item.product_id,
             quantity=item.quantity,
             type="IN",
-            place=None
+            place=None,
+            receipt_id=receipt.id
         )
-        db.add(movement)
+        db.add(move)
 
     db.commit()
 
-    return {"status": "OK", "message": "Stan samochodu został zaktualizowany"}
+    return {"status": "OK", "receipt_id": receipt.id}
 
 
 # =====================================================
-# AKTUALNY STAN SAMOCHODU
+# LISTA DOKUMENTÓW POBRANIA
 # =====================================================
 
-@router.get("/car/state", response_model=List[CarStockItem])
-def get_car_state(
+class GoodsReceiptListItemDto(BaseModel):
+    id: int
+    date: str
+    received_by: str
+    issued_by: str
+    items_count: int
+
+    class Config:
+        orm_mode = True
+
+
+@router.get("/receipts", response_model=List[GoodsReceiptListItemDto])
+def list_receipts(
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
     rows = (
-        db.query(
-            models.CarStock.product_id,
-            models.Product.name,
-            models.Product.category,
-            models.Product.unit,
-            models.CarStock.quantity
-        )
-        .join(models.Product, models.Product.id == models.CarStock.product_id)
-        .filter(models.CarStock.car_plate == user.car_plate)
-        .order_by(models.Product.id)
+        db.query(models.GoodsReceipt)
+        .filter(models.GoodsReceipt.car_plate == user.car_plate)
+        .order_by(models.GoodsReceipt.date.desc())
         .all()
     )
 
-    return [
-        CarStockItem(
-            product_id=r.product_id,
-            name=r.name,
-            category=r.category,
-            unit=r.unit,
-            quantity=r.quantity
-        )
-        for r in rows
-    ]
-
-
-# =====================================================
-# HISTORIA RUCHÓW
-# =====================================================
-
-@router.get("/history", response_model=List[MovementItem])
-def history(
-    product_id: Optional[int] = None,
-    type: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user)
-):
-    q = (
-        db.query(models.StockMovement, models.Product)
-        .join(models.Product, models.Product.id == models.StockMovement.product_id)
-        .filter(models.StockMovement.car_plate == user.car_plate)
-    )
-
-    if product_id is not None:
-        q = q.filter(models.StockMovement.product_id == product_id)
-
-    if type is not None:
-        q = q.filter(models.StockMovement.type == type)
-
-    if date_from is not None:
-        q = q.filter(models.StockMovement.timestamp >= date_from)
-
-    if date_to is not None:
-        q = q.filter(models.StockMovement.timestamp <= date_to)
-
-    q = q.order_by(models.StockMovement.timestamp.desc())
-
-    rows = q.all()
-    result: List[MovementItem] = []
-
-    for movement, product in rows:
-        result.append(
-            MovementItem(
-                id=movement.id,
-                timestamp=str(movement.timestamp),
-                product_id=product.id,
-                product_name=product.name,
-                index=product.index,
-                quantity=movement.quantity,
-                type=movement.type,
-                place=movement.place,
-            )
-        )
+    result = []
+    for r in rows:
+        result.append(GoodsReceiptListItemDto(
+            id=r.id,
+            date=str(r.date),
+            received_by=r.received_by,
+            issued_by=r.issued_by,
+            items_count=len(r.items)
+        ))
 
     return result
 
 
 # =====================================================
-# EKSPORT STANU SAMOCHODU DO EXCELA
+# SZCZEGÓŁY DOKUMENTU POBRANIA
 # =====================================================
 
-@router.get("/car/state/export")
-def export_car_state(
+class GoodsReceiptDetailsItemDto(BaseModel):
+    product_id: int
+    name: str
+    index: str
+    unit: str
+    quantity: float
+
+
+class GoodsReceiptDetailsDto(BaseModel):
+    id: int
+    date: str
+    received_by: str
+    issued_by: str
+    items: List[GoodsReceiptDetailsItemDto]
+
+
+@router.get("/receipt/{receipt_id}", response_model=GoodsReceiptDetailsDto)
+def get_receipt(
+    receipt_id: int,
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-    """
-    Eksport aktualnego stanu magazynu auta do pliku XLSX.
-    """
-    rows = (
-        db.query(
-            models.Product.name,
-            models.Product.category,
-            models.Product.unit,
-            models.CarStock.quantity
-        )
-        .join(models.Product, models.Product.id == models.CarStock.product_id)
-        .filter(models.CarStock.car_plate == user.car_plate)
-        .order_by(models.Product.id)
-        .all()
+    receipt = db.query(models.GoodsReceipt).filter(models.GoodsReceipt.id == receipt_id).first()
+    if not receipt:
+        raise HTTPException(404, "Dokument nie istnieje")
+
+    if receipt.car_plate != user.car_plate:
+        raise HTTPException(403, "Brak dostępu do tego dokumentu")
+
+    items = []
+    for row in receipt.items:
+        p = row.product
+        items.append(GoodsReceiptDetailsItemDto(
+            product_id=p.id,
+            name=p.name,
+            index=p.index,
+            unit=p.unit,
+            quantity=row.quantity
+        ))
+
+    return GoodsReceiptDetailsDto(
+        id=receipt.id,
+        date=str(receipt.date),
+        received_by=receipt.received_by,
+        issued_by=receipt.issued_by,
+        items=items
     )
 
-    if not rows:
-        raise HTTPException(status_code=400, detail="Brak towaru w samochodzie")
+
+# =====================================================
+# EKSPORT DOKUMENTU DO EXCEL
+# =====================================================
+
+@router.get("/receipt/{receipt_id}/export/excel")
+def export_receipt_excel(
+    receipt_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    receipt = db.query(models.GoodsReceipt).filter(models.GoodsReceipt.id == receipt_id).first()
+    if not receipt:
+        raise HTTPException(404, "Dokument nie istnieje")
+
+    if receipt.car_plate != user.car_plate:
+        raise HTTPException(403, "Brak uprawnień")
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Stan magazynu"
+    ws.title = "Pobranie"
 
-    ws.append(["Nazwa", "Kategoria", "Jednostka", "Ilość"])
+    ws.append(["Data", str(receipt.date)])
+    ws.append(["Pobierający", receipt.received_by])
+    ws.append(["Wydający", receipt.issued_by])
+    ws.append([])
+    ws.append(["Produkt", "Indeks", "Jednostka", "Ilość"])
 
-    for name, category, unit, qty in rows:
-        ws.append([name, category, unit, qty])
+    for item in receipt.items:
+        ws.append([item.product.name, item.product.index, item.product.unit, item.quantity])
 
     stream = io.BytesIO()
     wb.save(stream)
     stream.seek(0)
 
-    filename = f"stan_{user.car_plate}.xlsx"
+    filename = f"pobranie_{receipt.id}.xlsx"
 
     return StreamingResponse(
         stream,
-        media_type=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        }
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+# =====================================================
+# EKSPORT DOKUMENTU DO PDF
+# =====================================================
+
+@router.get("/receipt/{receipt_id}/export/pdf")
+def export_receipt_pdf(
+    receipt_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    receipt = db.query(models.GoodsReceipt).filter(models.GoodsReceipt.id == receipt_id).first()
+    if not receipt:
+        raise HTTPException(404, "Dokument nie istnieje")
+
+    if receipt.car_plate != user.car_plate:
+        raise HTTPException(403, "Brak uprawnień")
+
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+
+    x = 40
+    y = 800
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(x, y, f"DOKUMENT POBRANIA #{receipt.id}")
+    y -= 30
+
+    c.setFont("Helvetica", 12)
+    c.drawString(x, y, f"Data: {receipt.date}")
+    y -= 20
+
+    c.drawString(x, y, f"Pobierający: {receipt.received_by}")
+    y -= 20
+
+    c.drawString(x, y, f"Wydający: {receipt.issued_by}")
+    y -= 30
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x, y, "Produkt / Indeks / Jed. / Ilość")
+    y -= 20
+
+    c.setFont("Helvetica", 12)
+
+    for item in receipt.items:
+        line = f"{item.product.name}  |  {item.product.index}  |  {item.product.unit}  |  {item.quantity}"
+        c.drawString(x, y, line)
+        y -= 20
+        if y < 40:
+            c.showPage()
+            y = 800
+
+    c.save()
+
+    buffer.seek(0)
+    filename = f"pobranie_{receipt.id}.pdf"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
