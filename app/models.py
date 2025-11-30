@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, Float, DateTime, func, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, Text, Float, DateTime, Date, func, ForeignKey
 from sqlalchemy.orm import relationship
 from .database import Base
 
@@ -23,6 +23,9 @@ class User(Base):
     # relacja do historii ruchów
     movements = relationship("StockMovement", back_populates="user")
 
+    # relacja do dokumentów pobrań
+    receive_headers = relationship("StockReceiveHeader", back_populates="user")
+
 
 # -----------------------------
 # PRODUCT
@@ -40,6 +43,9 @@ class Product(Base):
     # relacja do ruchów
     movements = relationship("StockMovement", back_populates="product")
 
+    # relacja do pozycji w dokumentach pobrań
+    receive_items = relationship("StockReceiveItem", back_populates="product")
+
 
 # -----------------------------
 # STOCK IN CAR
@@ -56,45 +62,6 @@ class CarStock(Base):
 
 
 # -----------------------------
-# GOODS RECEIPT (nagłówek pobrania)
-# -----------------------------
-class GoodsReceipt(Base):
-    __tablename__ = "goods_receipts"
-
-    id = Column(Integer, primary_key=True, index=True)
-
-    date = Column(DateTime(timezone=True), server_default=func.now())
-    car_plate = Column(String, nullable=False)
-
-    received_by = Column(String, nullable=False)   # osoba pobierająca
-    issued_by = Column(String, nullable=False)     # osoba wydająca
-
-    # relacja 1:N do pozycji
-    items = relationship("GoodsReceiptItem", back_populates="receipt")
-
-    # relacja do ruchów magazynowych
-    movements = relationship("StockMovement", back_populates="receipt")
-
-
-# -----------------------------
-# GOODS RECEIPT ITEM (pozycje pobrania)
-# -----------------------------
-class GoodsReceiptItem(Base):
-    __tablename__ = "goods_receipt_items"
-
-    id = Column(Integer, primary_key=True, index=True)
-
-    receipt_id = Column(Integer, ForeignKey("goods_receipts.id"), nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
-
-    quantity = Column(Float, nullable=False)
-
-    # relacje
-    receipt = relationship("GoodsReceipt", back_populates="items")
-    product = relationship("Product")
-
-
-# -----------------------------
 # STOCK MOVEMENTS LOG
 # -----------------------------
 class StockMovement(Base):
@@ -107,14 +74,72 @@ class StockMovement(Base):
     car_plate = Column(String, nullable=False)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
 
-    quantity = Column(Float, nullable=False)
-    type = Column(String, nullable=False)  # IN / OUT / RESET
-    place = Column(String, nullable=True)
-
-    # Nowe: powiązanie z dokumentem pobrania (opcjonalne)
-    receipt_id = Column(Integer, ForeignKey("goods_receipts.id"), nullable=True)
+    quantity = Column(Float, nullable=False)   # dodatnie = IN, ujemne = OUT
+    type = Column(String, nullable=False)      # IN / OUT / RESET
+    place = Column(String, nullable=True)      # np. miejsce zużycia przy OUT
 
     # relacje
     user = relationship("User", back_populates="movements")
     product = relationship("Product", back_populates="movements")
-    receipt = relationship("GoodsReceipt", back_populates="movements")
+
+
+# -----------------------------
+# DOKUMENT POBRANIA (NAGŁÓWEK)
+# -----------------------------
+class StockReceiveHeader(Base):
+    """
+    Jeden dokument pobrania towaru z magazynu zewnętrznego na samochód.
+    Zawiera:
+    - datę pobrania (document_date),
+    - osobę pobierającą,
+    - osobę wydającą,
+    - numer auta (car_plate),
+    - użytkownika w systemie, który to wprowadził (user_id),
+    - listę pozycji (items).
+    """
+    __tablename__ = "stock_receive_headers"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    document_date = Column(Date, nullable=False)
+
+    taker_name = Column(String, nullable=False)   # osoba pobierająca
+    giver_name = Column(String, nullable=False)   # osoba wydająca
+
+    car_plate = Column(String, nullable=False)
+
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # relacje
+    user = relationship("User", back_populates="receive_headers")
+    items = relationship(
+        "StockReceiveItem",
+        back_populates="header",
+        cascade="all, delete-orphan"
+    )
+
+
+# -----------------------------
+# DOKUMENT POBRANIA (POZYCJE)
+# -----------------------------
+class StockReceiveItem(Base):
+    """
+    Pojedyncza pozycja w dokumencie pobrania.
+    Każdy wiersz wskazuje:
+    - dokument (header_id),
+    - produkt (product_id),
+    - ilość.
+    """
+    __tablename__ = "stock_receive_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    header_id = Column(Integer, ForeignKey("stock_receive_headers.id"), nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+
+    quantity = Column(Float, nullable=False)
+
+    # relacje
+    header = relationship("StockReceiveHeader", back_populates="items")
+    product = relationship("Product", back_populates="receive_items")
